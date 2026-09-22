@@ -44,6 +44,7 @@
  * 负责整合全局布局组件和管理登录状态
  */
 import { authState } from './utils/auth'
+import { eventBus } from './utils/eventBus'
 import NavBar from './components/NavBar.vue'
 import FooterBar from './components/FooterBar.vue'
 import LoginModal from './components/LoginModal.vue'
@@ -75,6 +76,13 @@ export default {
     userName() {
       return authState.user?.name || 'U'
     }
+  },
+  mounted() {
+    // 任意页面可通过事件总线请求打开全局登录弹窗（如训练打卡页）
+    this.offOpenLogin = eventBus.on('open-login', this.openLogin)
+  },
+  beforeUnmount() {
+    this.offOpenLogin?.()
   },
   methods: {
     /**

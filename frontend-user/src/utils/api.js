@@ -24,7 +24,31 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
 
 // 任务存储（用于任务中心数据持久化）
 import { taskStore as ts } from './taskStore'
+import { trainingStore, TrainingError, isRetryableCode } from './trainingStore'
 const taskStore = ts
+
+/**
+ * 请求失败自动重试
+ * - 仅对「可重试」错误（网络错误、HTTP 5xx、模拟网络故障）重试
+ * - 校验类错误（重复打卡、未来日期、目标冲突等 4xx 语义）立即返回，不重试
+ */
+const DEFAULT_RETRY_TIMES = 2 // 首次失败后的额外重试次数
+let retryDelayMs = 300
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+/** 测试钩子：设置重试间隔（测试中置 0 以加速） */
+export function __setRetryDelay(ms) {
+  retryDelayMs = ms
+}
+
+/**
+ * 测试钩子：强制下若干次 mock 请求以网络故障失败。
+ * 例如 failNextMockRequests(2) 会让接下来的 2 次尝试失败，第 3 次成功。
+ */
+let mockFailuresLeft = 0
+export function failNextMockRequests(times) {
+  mockFailuresLeft = times
+}
 
 /**
  * 模拟网络延迟
@@ -115,16 +139,37 @@ export const logger = {
  * })
  */
 async function request(url, options = {}) {
+  const retries = options.retries != null ? options.retries : DEFAULT_RETRY_TIMES
+  let lastError
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    if (attempt > 0) {
+      logger.warn(`Retrying request (${attempt}/${retries})`, { url })
+      await wait(retryDelayMs)
+    }
+    const result = await executeRequest(url, options)
+    if (result.success) return result
+
+    lastError = result
+    // 校验类业务错误（4xx 语义）重试无意义，立即返回
+    if (!result.retryable) return result
+  }
+
+  logger.error(`Request failed after ${retries} retries`, { url, error: lastError?.error })
+  return lastError
+}
+
+async function executeRequest(url, options = {}) {
   const fullUrl = `${API_BASE_URL}${url}`
   logger.info(`API Request: ${options.method || 'GET'} ${fullUrl}`)
-  
+
   try {
     // 模拟模式：使用前端模拟数据
     if (import.meta.env.VITE_USE_MOCK !== 'false') {
       logger.debug('Using mock data mode')
       return await mockRequest(url, options)
     }
-    
+
     // 真实API调用
     const response = await fetch(fullUrl, {
       headers: {
@@ -134,22 +179,30 @@ async function request(url, options = {}) {
       },
       ...options
     })
-    
+
     // 检查HTTP状态码
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`)
+      // 5xx 服务端错误可重试；4xx 客户端/校验错误不重试
+      const retryable = response.status >= 500
+      throw Object.assign(
+        new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`),
+        { retryable, code: errorData.code, status: response.status }
+      )
     }
-    
+
     const data = await response.json()
     logger.info(`API Response: ${url}`, { status: 'success' })
     return { success: true, data }
-    
+
   } catch (error) {
-    // 统一错误处理
+    // 统一错误处理：网络中断/超时通常可重试
+    const retryable = error.retryable !== false
     logger.error(`API Error: ${url}`, error)
-    return { 
-      success: false, 
+    return {
+      success: false,
+      retryable,
+      code: error.code,
       error: error.message || '网络请求失败，请稍后重试'
     }
   }
@@ -164,9 +217,15 @@ async function request(url, options = {}) {
  * @returns {Promise<{success: boolean, data: any}>}
  */
 async function mockRequest(url, options) {
+  // 测试钩子：模拟瞬时网络故障（在延迟之前判定，避免测试无谓等待）
+  if (mockFailuresLeft > 0) {
+    mockFailuresLeft--
+    throw Object.assign(new Error('网络异常，请检查连接后重试'), { retryable: true })
+  }
+
   // 模拟网络延迟 500-1000ms
   await delay(500 + Math.random() * 500)
-  
+
   // URL到处理函数的映射
   const mockHandlers = {
     '/auth/login': handleLogin,
@@ -178,16 +237,28 @@ async function mockRequest(url, options) {
     '/user/profile': () => mockData.user,
     '/bookings': handleBookings,
     '/orders': handleOrders,
-    '/user/tasks': handleUserTasks
+    '/user/tasks': handleUserTasks,
+    '/training/plans': handleTrainingPlans,
+    '/training/checkins': handleTrainingCheckins,
+    '/training/stats': () => trainingStore.getStats()
   }
   
   const handler = mockHandlers[url]
   if (handler) {
     try {
       const result = await handler(options)
+      // 处理函数显式返回的业务错误（重复打卡/目标冲突等）直接透传，不包成成功
+      if (result && result.success === false) {
+        return result
+      }
       return { success: true, data: result }
     } catch (error) {
-      return { success: false, error: error.message }
+      return {
+        success: false,
+        error: error.message,
+        code: error.code,
+        retryable: error.retryable !== false
+      }
     }
   }
   
@@ -296,6 +367,62 @@ function handleUserTasks(options) {
     return taskStore.getByStatus(params.status)
   }
   return taskStore.getAll()
+}
+
+/**
+ * 将训练存储层抛出的业务错误转换为统一的「不可重试」错误结果。
+ * 校验类错误（重复打卡/未来日期/目标冲突等）不应触发重试。
+ */
+function handleTrainingError(error) {
+  if (error instanceof TrainingError) {
+    return {
+      success: false,
+      retryable: isRetryableCode(error.code),
+      code: error.code,
+      field: error.field,
+      error: error.message
+    }
+  }
+  throw error
+}
+
+/**
+ * 训练计划相关请求
+ * GET: 返回计划列表（含实时派生的状态与进度）
+ * POST: 创建训练计划（目标冲突/参数非法时返回不可重试的业务错误）
+ */
+function handleTrainingPlans(options) {
+  try {
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body || '{}')
+      return trainingStore.createPlan(body)
+    }
+    const params = options.params || {}
+    if (params.planId) {
+      return trainingStore.getPlan(params.planId)
+    }
+    return trainingStore.getPlans()
+  } catch (error) {
+    return handleTrainingError(error)
+  }
+}
+
+/**
+ * 训练打卡相关请求
+ * GET: 返回打卡历史
+ * POST: 提交一次打卡（重复打卡/未来日期返回不可重试的业务错误）
+ */
+function handleTrainingCheckins(options) {
+  try {
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body || '{}')
+      return trainingStore.checkin(body)
+    }
+    const params = options.params || {}
+    return trainingStore.getHistory(params.planId)
+  } catch (error) {
+    return handleTrainingError(error)
+  }
 }
 
 // ==================== 模拟数据定义 ====================
@@ -498,7 +625,53 @@ export const api = {
   doTaskAction: (data) => request('/user/tasks', {
     method: 'POST',
     body: JSON.stringify(data)
-  })
+  }),
+
+  // ========== 训练计划与打卡模块 ==========
+
+  /**
+   * 获取训练计划列表（状态与进度由存储层按当前日期实时派生）
+   */
+  getTrainingPlans: () => request('/training/plans'),
+
+  /**
+   * 创建训练计划
+   * @param {Object} data - 计划信息
+   * @param {string} data.title - 计划名称
+   * @param {string} data.goalType - 目标类型 count(次数)/duration(时长)
+   * @param {number} data.targetValue - 目标量
+   * @param {string} data.startDate - 开始日期 YYYY-MM-DD
+   * @param {string} data.endDate - 结束日期 YYYY-MM-DD
+   */
+  createTrainingPlan: (data) => request('/training/plans', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
+
+  /**
+   * 提交一次练习打卡
+   * @param {Object} data - 打卡信息
+   * @param {string} data.planId - 计划ID
+   * @param {string} data.date - 打卡日期 YYYY-MM-DD（不可为未来日期）
+   * @param {number} data.value - 本次练习量
+   * @param {string} [data.note] - 备注
+   */
+  createCheckin: (data) => request('/training/checkins', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  }),
+
+  /**
+   * 获取打卡历史
+   * @param {Object} [params]
+   * @param {string} [params.planId] - 仅查看某计划的打卡
+   */
+  getCheckins: (params) => request('/training/checkins', { params }),
+
+  /**
+   * 获取训练总览统计
+   */
+  getTrainingStats: () => request('/training/stats')
 }
 
 export default api
