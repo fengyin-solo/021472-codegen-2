@@ -7,6 +7,7 @@ import Competitions from '../views/Competitions.vue'
 import Shop from '../views/Shop.vue'
 import Profile from '../views/Profile.vue'
 import Tasks from '../views/Tasks.vue'
+import Training from '../views/Training.vue'
 
 const routes = [
   { path: '/', name: 'Home', component: Home },
@@ -15,7 +16,8 @@ const routes = [
   { path: '/competitions', name: 'Competitions', component: Competitions },
   { path: '/shop', name: 'Shop', component: Shop },
   { path: '/profile', name: 'Profile', component: Profile },
-  { path: '/tasks', name: 'Tasks', component: Tasks }
+  { path: '/tasks', name: 'Tasks', component: Tasks },
+  { path: '/training', name: 'Training', component: Training }
 ]
 
 const router = createRouter({

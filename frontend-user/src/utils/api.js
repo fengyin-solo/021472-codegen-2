@@ -24,7 +24,57 @@ const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
 
 // 任务存储（用于任务中心数据持久化）
 import { taskStore as ts } from './taskStore'
+import { trainingStore as tStore, ValidationError as TrainingValidationError } from './trainingStore'
 const taskStore = ts
+const trainingStore = tStore
+
+// 测试/调试钩子：控制 mock 网络延迟与失败注入（生产环境无副作用）
+let mockDelayMs = null // 为 null 时使用默认随机延迟
+let mockFailureByUrl = {}
+/**
+ * 仅供测试：设置 mock 网络行为
+ * @param {Object} cfg - { delayMs?: number|null, failures?: { [url]: { attempts: number, afterPersist?: boolean } } }
+ */
+export function __setMockNetwork(cfg = {}) {
+  if (typeof cfg.delayMs !== 'undefined') mockDelayMs = cfg.delayMs
+  if (cfg.failures) mockFailureByUrl = cfg.failures
+}
+
+/**
+ * 通用失败重试封装（指数退避）
+ * 仅对网络类错误（无 errorCode）重试；业务校验错误（如重复打卡、未来日期、
+ * 目标冲突）立即抛出，不做无意义重试。
+ *
+ * @param {function(attempt: number): Promise} fn - 业务请求，需返回 { success, data, error, errorCode }
+ * @param {Object} options
+ * @param {number} options.retries - 额外重试次数，默认 2
+ * @param {number} options.baseDelay - 首次退避毫秒数，默认 300
+ * @param {function} options.onRetry - 重试回调
+ */
+export async function withRetry(fn, options = {}) {
+  const retries = options.retries ?? 2
+  const baseDelay = options.baseDelay ?? 300
+  const onRetry = options.onRetry || null
+  let lastError
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const result = await fn(attempt)
+    if (result && result.success) return result
+
+    const error = new Error(result?.error || '网络请求失败，请稍后重试')
+    error.errorCode = result?.errorCode
+    lastError = error
+
+    // 业务错误不重试（未来日期/重复打卡/目标冲突/参数非法等）
+    const isNetworkError = !result?.errorCode
+    if (attempt >= retries || !isNetworkError) throw error
+
+    const waitMs = baseDelay * Math.pow(2, attempt)
+    if (onRetry) onRetry({ attempt: attempt + 1, waitMs, error })
+    await delay(waitMs)
+  }
+  throw lastError
+}
 
 /**
  * 模拟网络延迟
@@ -138,19 +188,22 @@ async function request(url, options = {}) {
     // 检查HTTP状态码
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`)
+      const error = new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`)
+      error.errorCode = errorData.errorCode
+      throw error
     }
-    
+
     const data = await response.json()
     logger.info(`API Response: ${url}`, { status: 'success' })
     return { success: true, data }
-    
+
   } catch (error) {
     // 统一错误处理
     logger.error(`API Error: ${url}`, error)
-    return { 
-      success: false, 
-      error: error.message || '网络请求失败，请稍后重试'
+    return {
+      success: false,
+      error: error.message || '网络请求失败，请稍后重试',
+      errorCode: error.errorCode
     }
   }
 }
@@ -164,11 +217,11 @@ async function request(url, options = {}) {
  * @returns {Promise<{success: boolean, data: any}>}
  */
 async function mockRequest(url, options) {
-  // 模拟网络延迟 500-1000ms
-  await delay(500 + Math.random() * 500)
-  
-  // URL到处理函数的映射
-  const mockHandlers = {
+  // 模拟网络延迟（测试可通过 __setMockNetwork 覆盖为固定值/0）
+  await delay(mockDelayMs === null ? 500 + Math.random() * 500 : mockDelayMs)
+
+  // URL到处理函数的映射（支持 REST 路径前缀匹配）
+  const exactHandlers = {
     '/auth/login': handleLogin,
     '/auth/logout': handleLogout,
     '/tables': () => mockData.tables,
@@ -178,20 +231,48 @@ async function mockRequest(url, options) {
     '/user/profile': () => mockData.user,
     '/bookings': handleBookings,
     '/orders': handleOrders,
-    '/user/tasks': handleUserTasks
+    '/user/tasks': handleUserTasks,
+    '/training/plans': handleTrainingPlans,
+    '/training/checkins': handleTrainingCheckins,
+    '/training/stats': () => trainingStore.getStats()
   }
-  
-  const handler = mockHandlers[url]
+
+  const exactUrl = url.split('?')[0]
+  const handler = exactHandlers[exactUrl]
   if (handler) {
     try {
-      const result = await handler(options)
+      const result = await handler(options, exactUrl)
       return { success: true, data: result }
     } catch (error) {
-      return { success: false, error: error.message }
+      return { success: false, error: error.message, errorCode: error.code }
     }
   }
-  
+
+  // 训练计划单资源 REST：/training/plans/:id
+  const planMatch = exactUrl.match(/^\/training\/plans\/([^/]+)$/)
+  if (planMatch) {
+    try {
+      const result = await handleTrainingPlanById(planMatch[1], options)
+      return { success: true, data: result }
+    } catch (error) {
+      return { success: false, error: error.message, errorCode: error.code }
+    }
+  }
+
   return { success: false, error: `API not found: ${url}` }
+}
+
+/**
+ * 模拟网络失败（仅在 mock 模式下生效）
+ * @param {string} url - 请求地址
+ * @param {boolean} afterPersist - 是否已先完成持久化（模拟服务端已处理但响应丢失）
+ */
+function maybeMockNetworkFailure(url, afterPersist) {
+  const rule = mockFailureByUrl[url]
+  if (!rule || rule.attempts <= 0) return
+  rule.attempts -= 1
+  const suffix = afterPersist && rule.afterPersist ? '（服务端已处理，响应丢失）' : ''
+  throw new Error('网络异常，请检查网络后重试' + suffix)
 }
 
 // ==================== 模拟数据处理函数 ====================
@@ -296,6 +377,94 @@ function handleUserTasks(options) {
     return taskStore.getByStatus(params.status)
   }
   return taskStore.getAll()
+}
+
+// ==================== 训练计划与打卡处理函数 ====================
+
+/**
+ * 训练计划集合
+ * GET: 返回计划列表（含实时状态与进度）
+ * POST: 创建计划（目标冲突时返回业务错误）
+ */
+function handleTrainingPlans(options) {
+  if (options.method === 'POST') {
+    maybeMockNetworkFailure('/training/plans', false)
+    const body = JSON.parse(options.body || '{}')
+    return trainingStore.createPlan(body)
+  }
+  return trainingStore.getAllPlans()
+}
+
+/**
+ * 单个训练计划
+ * PUT: 更新计划
+ * DELETE: 删除计划
+ */
+function handleTrainingPlanById(planId, options) {
+  if (options.method === 'PUT') {
+    const body = JSON.parse(options.body || '{}')
+    return trainingStore.updatePlan(planId, body)
+  }
+  if (options.method === 'DELETE') {
+    const ok = trainingStore.removePlan(planId)
+    if (!ok) {
+      throw new TrainingValidationError('PLAN_NOT_FOUND', '训练计划不存在或已被删除')
+    }
+    return { success: true }
+  }
+  const plan = trainingStore.getPlanById(planId)
+  if (!plan) {
+    throw new TrainingValidationError('PLAN_NOT_FOUND', '训练计划不存在或已被删除')
+  }
+  return plan
+}
+
+/**
+ * 打卡
+ * GET: 返回打卡历史（?limit=N）
+ * POST: 新增打卡
+ * DELETE: 撤销打卡（body: planId/date）
+ *   - 重复打卡 / 未来日期 / 计划不存在 等为业务错误（errorCode，不重试）
+ *   - 通过 clientRequestId 保证失败重试幂等：服务端已处理但响应丢失时，
+ *     重试会返回首次创建的同一条记录，绝不产生第二条
+ */
+function handleTrainingCheckins(options) {
+  if (options.method === 'POST') {
+    const body = JSON.parse(options.body || '{}')
+    const { clientRequestId } = body
+
+    // 幂等命中：请求失败后的重试，直接返回首次写入的记录
+    if (clientRequestId) {
+      const existing = trainingStore.getHistory().find(c => c.id === 'CHK-' + clientRequestId)
+      if (existing) {
+        maybeMockNetworkFailure('/training/checkins', true)
+        return existing
+      }
+    }
+
+    // 先模拟一次「持久化后响应丢失」，随后再正常落库
+    const rule = mockFailureByUrl['/training/checkins']
+    if (rule && rule.afterPersist && rule.attempts > 0) {
+      // 落库（可能抛业务错误，此时不应计网络失败）
+      trainingStore.addCheckin(body, { clientRequestId })
+      rule.attempts -= 1
+      throw new Error('网络异常，服务端可能已处理，正在重试确认')
+    }
+
+    maybeMockNetworkFailure('/training/checkins', false)
+    return trainingStore.addCheckin(body, { clientRequestId })
+  }
+  if (options.method === 'DELETE') {
+    maybeMockNetworkFailure('/training/checkins', false)
+    const body = JSON.parse(options.body || '{}')
+    const ok = trainingStore.undoCheckin(body.planId, body.date)
+    if (!ok) {
+      throw new TrainingValidationError('CHECKIN_NOT_FOUND', '打卡记录不存在，无法撤销')
+    }
+    return { success: true }
+  }
+  const limit = options.params && options.params.limit ? Number(options.params.limit) : undefined
+  return trainingStore.getHistory(limit)
 }
 
 // ==================== 模拟数据定义 ====================
@@ -498,7 +667,77 @@ export const api = {
   doTaskAction: (data) => request('/user/tasks', {
     method: 'POST',
     body: JSON.stringify(data)
-  })
+  }),
+
+  // ========== 训练计划与打卡模块 ==========
+
+  /**
+   * 获取训练计划列表（状态按当天日期实时推导）
+   */
+  getTrainingPlans: () => request('/training/plans'),
+
+  /**
+   * 获取单个训练计划
+   */
+  getTrainingPlan: (planId) => request(`/training/plans/${planId}`),
+
+  /**
+   * 创建训练计划
+   * @param {Object} data - title/goalType/goalTarget/startDate/endDate/weeklyTimes/weeklyMinutes
+   */
+  createTrainingPlan: (data) =>
+    withRetry(() => request('/training/plans', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    })),
+
+  /**
+   * 更新训练计划
+   */
+  updateTrainingPlan: (planId, data) =>
+    withRetry(() => request(`/training/plans/${planId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })),
+
+  /**
+   * 删除训练计划
+   */
+  deleteTrainingPlan: (planId) =>
+    withRetry(() => request(`/training/plans/${planId}`, { method: 'DELETE' })),
+
+  /**
+   * 获取打卡历史
+   * @param {Object} params - { limit }
+   */
+  getCheckins: (params) => request('/training/checkins', { params }),
+
+  /**
+   * 训练打卡
+   * @param {Object} data - planId/date/duration/content/note/clientRequestId
+   * 网络失败自动重试；clientRequestId 保证重试幂等，业务错误（重复打卡、
+   * 未来日期等）不会重试并直接抛出。
+   */
+  createCheckin: (data, options) =>
+    withRetry(() => request('/training/checkins', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    }), options),
+
+  /**
+   * 撤销某日打卡（仅用于误操作纠正）
+   * @param {Object} data - planId/date
+   */
+  undoCheckin: (data) =>
+    withRetry(() => request('/training/checkins', {
+      method: 'DELETE',
+      body: JSON.stringify(data)
+    })),
+
+  /**
+   * 获取训练汇总统计
+   */
+  getTrainingStats: () => request('/training/stats')
 }
 
 export default api

@@ -54,6 +54,10 @@
           <span class="link-text">任务中心</span>
           <span class="link-indicator"></span>
         </router-link>
+        <router-link v-if="isLoggedIn" to="/training" class="nav-link">
+          <span class="link-text">训练打卡</span>
+          <span class="link-indicator"></span>
+        </router-link>
         
         <!-- 用户头像（已登录） -->
         <router-link v-if="isLoggedIn" to="/profile" class="nav-link profile-link">
